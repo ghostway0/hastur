@@ -164,8 +164,6 @@ void assign_spillslots(std::vector<LiveBundle> &bundles, std::vector<Stitch> con
 } // namespace
 
 Output Allocator::run(std::span<LiveBundle> bundles) {
-    std::set<size_t> spills;
-
     for (LiveBundle &bundle : bundles) {
         for (LiveRange *range : bundle.ranges()) {
             pending_.push(range);
@@ -186,21 +184,18 @@ Output Allocator::run(std::span<LiveBundle> bundles) {
         }
     }
 
+    // code duplication is not great
     while (!second_chance_.empty()) {
         LiveRange *range = second_chance_.top();
-        pending_.pop();
+        second_chance_.pop();
 
         if (auto preg = run_once(range); preg) {
             bundles_.at(range->parent_id).set_allocation(Allocation{preg.value()});
             trees_.at(range->type).insert(range->live_interval(), range);
         } else {
-            spills.insert(range->parent_id);
+            LiveBundle &bundle = bundles_.at(range->parent_id);
+            bundle.set_allocation(Allocation::spill());
         }
-    }
-
-    for (size_t id : spills) {
-        LiveBundle &bundle = bundles_.at(id);
-        bundle.set_allocation(Allocation::spill());
     }
 
     return Output::from_bundles(bundles_.extract_all());
