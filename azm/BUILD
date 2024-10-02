@@ -29,3 +29,24 @@ cc_binary(
         ":azm",
     ],
 )
+
+cc_library(
+    name = "wasm_jit",
+    srcs = glob(["jit.cpp"]),
+    hdrs = glob(["jit.h"]),
+    copts = HASTUR_COPTS,
+    visibility = ["//visibility:public"],
+    deps = [
+        ":azm",
+        "//wasm",
+    ],
+)
+
+cc_binary(
+    name = "wasm_jit_example",
+    srcs = ["wasm_jit_example.cpp"],
+    copts = HASTUR_COPTS,
+    deps = [
+        ":wasm_jit",
+    ],
+)

@@ -101,7 +101,7 @@ void patch_liveranges(std::vector<LiveRange *> ranges, std::vector<Stitch> &stit
             }
         }
 
-        if (range->parent->allocation().is_spill()) {
+        if (range->parent->allocation().is_nullspill()) {
             if (spill_slot_mapping.find(vreg) == spill_slot_mapping.end()) {
                 spill_slot_mapping[vreg] = spill_slot_offset;
                 spill_slot_offset += range->vreg.type.size_bytes();

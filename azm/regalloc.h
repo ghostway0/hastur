@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cassert>
 #include <cstdint>
 #include <expected>
 #include <map>
@@ -103,29 +104,30 @@ struct Register {
     auto operator<=>(Register const &other) const = default;
 };
 
+// should this just be a variant?
 class Allocation {
 public:
     Allocation() : bits_(kNull) {}
 
-    explicit Allocation(Register reg) : bits_(kReg | (static_cast<uint16_t>(reg.type) << 2) | reg.encoding) {}
+    explicit Allocation(Register reg) : bits_(kReg | (static_cast<uint16_t>(reg.type) << 2) | (reg.encoding << 4)) {}
 
-    Allocation(Register reg, RegClass reg_class)
-        : bits_(kReg | (static_cast<uint16_t>(reg_class) << 2) | reg.encoding) {}
-
-    explicit Allocation(uint16_t spill_slot) : bits_(kSpill | (spill_slot & 0x0FFF)) {}
+    Allocation(Register reg, RegClass reg_class) : Allocation{Register{reg_class, reg.encoding}} {}
 
     static Allocation reg(Register reg) { return Allocation{reg}; }
 
-    static Allocation spill(uint16_t slot) { return Allocation{slot}; }
+    static Allocation spill(int16_t slot) {
+        assert(slot < 0xFFF);
+        return Allocation{slot};
+    }
 
-    static Allocation spill() { return spill(static_cast<uint16_t>(-1)); }
+    static Allocation spill() { return Allocation{kInvalidSpill}; }
 
     static Allocation null() { return Allocation{}; }
 
     bool is_null() const { return bits_ == kNull; }
     bool is_reg() const { return (bits_ & 0x3) == kReg; }
     bool is_spill() const { return (bits_ & 0x3) == kSpill; }
-    bool is_nullspill() const { return is_spill() && spill_slot() == static_cast<uint16_t>(-1); }
+    bool is_nullspill() const { return is_spill() && spill_slot() == kInvalidSpill; }
 
     RegClass reg_class() const {
         assert(is_reg());
@@ -140,7 +142,7 @@ public:
         };
     }
 
-    uint16_t spill_slot() const {
+    int16_t spill_slot() const {
         assert(is_spill());
         return bits_ & 0x0FFF;
     }
@@ -161,6 +163,9 @@ private:
     static constexpr uint32_t kNull = 0x1;
     static constexpr uint32_t kReg = 0x2;
     static constexpr uint32_t kSpill = 0x3;
+    static constexpr uint32_t kInvalidSpill = 0xFFF;
+
+    explicit Allocation(int16_t slot) : bits_(kSpill | (slot & 0xFFF) << 2) {}
 };
 
 class LiveBundle;
@@ -241,6 +246,12 @@ struct TargetISA {
 
 struct PriorityCompare {
     bool operator()(LiveRange const *a, LiveRange const *b) { return a->spill_cost < b->spill_cost; }
+};
+
+struct StackSlot {
+    int16_t offset;
+
+    auto operator<=>(StackSlot const &other) const = default;
 };
 
 template<typename V>
