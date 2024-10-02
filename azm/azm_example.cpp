@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: BSD-2-Clause
 
 #include "azm/amd64/assembler.h"
+#include "regalloc.h"
 
 #include <algorithm>
 #include <iostream>

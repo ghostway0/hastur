@@ -1,4 +1,8 @@
+#include <cassert>
+#include <vector>
 #include <ranges>
+
+#include <absl/container/flat_hash_map.h>
 
 #include "regalloc.h"
 
@@ -74,90 +78,38 @@ std::optional<CodePoint> find_split_spot(LiveRange *range, std::span<LiveRange *
     return range->uses.front();
 }
 
-std::vector<Stitch> discover_stitches(std::span<LiveRange> allocated_ranges) {
-    std::sort(allocated_ranges.begin(), allocated_ranges.end(), [](LiveRange const &lhs, LiveRange const &rhs) {
-        return lhs < rhs;
+void patch_liveranges(std::vector<LiveRange *> ranges, std::vector<Stitch> &stitches) {
+    std::sort(ranges.begin(), ranges.end(), [](LiveRange *lhs, LiveRange *rhs) {
+        return lhs->live_interval().low < rhs->live_interval().low;
     });
 
-    std::map<Interval, void> intervals;
+    std::unordered_map<VirtualReg, LiveRange *> last_used;
+    std::unordered_map<VirtualReg, size_t> spill_slot_mapping;
+    size_t spill_slot_offset = 0;
 
-    for (LiveRange const &range : allocated_ranges) {
-        intervals.emplace(range.live_interval(), {});
-    }
+    for (LiveRange *range : ranges) {
+        auto const &vreg = range->vreg;
 
-    std::map<VirtualReg, LiveRange const *> last_used;
-
-    std::vector<Stitch> stitches;
-
-    for (auto const &[interval, _] : intervals) {
-        LiveRange const &representative = *interval.ranges().front();
-
-        if (auto last_range = last_used.find(representative.vreg); last_range != last_used.end()) {
-            if (interval.allocation() == last_range->second->allocation()) {
-                continue;
-            }
-
-            stitches.push_back(Stitch{
-                    .codepoint = last_range->second->end.next_inst(),
-                    .from = last_range->second->allocation(),
-                    .to = interval.allocation(),
-                    .vreg = representative.vreg,
-            });
-        }
-
-        last_used[representative.vreg] = &representative;
-    }
-
-    return stitches;
-}
-
-void assign_spillslots(std::vector<LiveBundle> &bundles, std::vector<Stitch> const &stitches) {
-    // assign spill slots based on the stitches and instructions. This basically goes over the instructions, finds the
-    // current rsp offset at every point, and when we encounter a spill, we assign it to the next available slot.
-
-    size_t idx = 0;
-    size_t delta = 0;
-
-    std::vector<LiveRange *> allocations;
-
-    for (LiveBundle const &bundle : bundles) {
-        for (LiveRange *range : bundle.ranges()) {
-            allocations.push_back(range);
-        }
-    }
-
-    std::sort(allocations.begin(), allocations.end(), [](LiveRange *lhs, LiveRange *rhs) {
-        return lhs->start < rhs->start;
-    });
-
-    std::vector<LiveRange *> active_ranges;
-    std::unordered_map<VirtualReg, size_t> active_stitch_mapping;
-
-    CodePoint current{0};
-
-    for (size_t i = 0; i < allocations.size(); i++) {
-        LiveRange *range = allocations[i];
-
-        if (range->start > current.late()) {
-            for (size_t j = 0; j < active_ranges.size();) {
-                if (active_ranges[j]->end < current) {
-                    active_ranges.erase(active_ranges.begin() + j);
-                } else {
-                    j++;
-                }
+        if (auto it = last_used.find(vreg); it != last_used.end()) {
+            if (range->parent->allocation() != it->second->parent->allocation()) {
+                stitches.push_back(Stitch{
+                        .vreg = vreg,
+                        .from = it->second->parent->allocation().reg(),
+                        .to = range->parent->allocation().reg(),
+                        .at = it->second->end.next_inst(),
+                });
             }
         }
 
-        if (range->start < current.late()) {
-            if (auto it = active_stitch_mapping.find(range->vreg); it != active_stitch_mapping.end()) {
-                range->set_allocation(Allocation::stack(it->second));
-            } else {
-                range->set_allocation(Allocation::stack(delta));
-                delta += range->type.size_bytes();
+        if (range->parent->allocation().is_spill()) {
+            if (spill_slot_mapping.find(vreg) == spill_slot_mapping.end()) {
+                spill_slot_mapping[vreg] = spill_slot_offset;
+                spill_slot_offset += range->vreg.type.size_bytes();
             }
+            range->parent->set_allocation(Allocation::spill(spill_slot_mapping[vreg]));
         }
 
-        current = current.next_inst();
+        last_used[vreg] = range;
     }
 }
 
@@ -168,8 +120,6 @@ Output Allocator::run(std::span<LiveBundle> bundles) {
         for (LiveRange *range : bundle.ranges()) {
             pending_.push(range);
         }
-
-        bundles_.insert(std::move(bundle));
     }
 
     while (!pending_.empty()) {
@@ -177,8 +127,8 @@ Output Allocator::run(std::span<LiveBundle> bundles) {
         pending_.pop();
 
         if (auto preg = run_once(range); preg) {
-            bundles_.at(range->parent_id).set_allocation(Allocation::reg(preg.value()));
-            trees_.at(range->type).insert(range->live_interval(), range);
+            range->parent.set_allocation(Allocation::reg(preg.value()));
+            trees_.at(range->vreg.type).insert(range->live_interval(), range);
         } else {
             second_chance_.push(range);
         }
@@ -190,20 +140,29 @@ Output Allocator::run(std::span<LiveBundle> bundles) {
         second_chance_.pop();
 
         if (auto preg = run_once(range); preg) {
-            bundles_.at(range->parent_id).set_allocation(Allocation{preg.value()});
-            trees_.at(range->type).insert(range->live_interval(), range);
+            range->parent.set_allocation(Allocation{preg.value()});
+            trees_.at(range->vreg.type).insert(range->live_interval(), range);
         } else {
-            LiveBundle &bundle = bundles_.at(range->parent_id);
-            bundle.set_allocation(Allocation::spill());
+            range->parent.set_allocation(Allocation::spill());
         }
     }
 
-    return Output::from_bundles(bundles_.extract_all());
+    return Output::from_ranges(extract_ranges());
+}
+
+std::vector<LiveRange *> Allocator::extract_ranges() {
+    std::vector<LiveRange *> result;
+
+    for (auto &[_, tree] : trees_) {
+        result.insert(result.end(), tree.extract_all().begin(), tree.extract_all().end());
+    }
+
+    return result;
 }
 
 std::optional<Register> Allocator::run_once(LiveRange *range) {
     std::vector<LiveRange *> interferences{};
-    trees_.at(range->type).overlap(range->live_interval(), interferences);
+    trees_.at(range->vreg.type).overlap(range->live_interval(), interferences);
 
     // 1. assign naively. where that doesn't work, evict if beneficial.
     if (std::optional<Register> preg = try_assign_might_evict(range, interferences); preg.has_value()) {
@@ -227,8 +186,7 @@ std::optional<Register> Allocator::get_unused_preg(RegClass type, std::span<Live
     std::vector<bool> used(isa_.registers.at(type).size(), false);
 
     for (auto [i, interference] : std::views::enumerate(interferences)) {
-        LiveBundle const &bundle = bundles_.at(interference->parent_id);
-        Allocation allocation = bundle.allocation();
+        Allocation allocation = interference->parent.allocation();
 
         if (!allocation.is_reg()) {
             continue;
@@ -246,12 +204,11 @@ std::optional<Register> Allocator::get_unused_preg(RegClass type, std::span<Live
     return std::nullopt;
 }
 
-std::map<Register, size_t> Allocator::calculate_eviction_costs(std::span<LiveRange *> interferences) {
+absl::flat_hash_map<Register, size_t> Allocator::calculate_eviction_costs(std::span<LiveRange *> interferences) {
     std::map<Register, size_t> eviction_costs;
 
     for (LiveRange const *interference : interferences) {
-        LiveBundle const &bundle = bundles_.at(interference->parent_id);
-        Allocation const &allocation = bundle.allocation();
+        Allocation const &allocation = interference->parent.allocation();
 
         if (!allocation.is_reg()) {
             continue;
@@ -264,7 +221,7 @@ std::map<Register, size_t> Allocator::calculate_eviction_costs(std::span<LiveRan
 }
 
 std::optional<Register> Allocator::try_assign_might_evict(LiveRange *range, std::span<LiveRange *> interferences) {
-    if (std::optional<Register> preg = get_unused_preg(range->type, interferences); preg) {
+    if (std::optional<Register> preg = get_unused_preg(range->vreg.type, interferences); preg) {
         return preg;
     }
 
@@ -293,38 +250,32 @@ std::optional<Register> Allocator::try_assign_might_evict(LiveRange *range, std:
 }
 
 bool Allocator::try_split(LiveRange *range, CodePoint at) {
-    LiveBundle &bundle = bundles_.at(range->parent_id);
+    LiveBundle *bundle = range->parent;
 
-    if (bundle.is_minimal()) {
+    if (bundle->is_minimal()) {
         return false;
     }
 
-    std::optional<LiveBundle> left = bundle.truncated(bundle.start(), at.prev_inst().late());
-    std::optional<LiveBundle> right = bundle.truncated(at, bundle.end());
+    std::optional<LiveBundle> left = bundle.truncated(bundle->start(), at.prev_inst().late());
+    std::optional<LiveBundle> right = bundle.truncated(at, bundle->end());
 
     if (!left.has_value() || !right.has_value()) {
         return false;
     }
 
-    bundles_.erase(range->parent_id);
-
-    if (left->num_ranges() + right->num_ranges() != bundle.num_ranges()) {
+    if (left->num_ranges() + right->num_ranges() != bundle->num_ranges()) {
         pending_.push(left->last_range());
         pending_.push(right->first_range());
     }
 
-    std::span<LiveRange *> left_ranges = left->ranges();
-    std::span<LiveRange *> right_ranges = right->ranges();
+    delete bundle;
 
-    size_t left_id = bundles_.insert(std::move(left.value()));
-    size_t right_id = bundles_.insert(std::move(right.value()));
-
-    for (LiveRange *range : left_ranges) {
-        range->parent_id = left_id;
+    for (LiveRange *range : left->ranges()) {
+        range->parent = left;
     }
 
-    for (LiveRange *range : right_ranges) {
-        range->parent_id = right_id;
+    for (LiveRange *range : right->ranges()) {
+        range->parent = right;
     }
 
     // avoid std::expected<std::optional<std::pair<LiveRange, LiveRange>>,
@@ -334,18 +285,15 @@ bool Allocator::try_split(LiveRange *range, CodePoint at) {
 
 void Allocator::evict_for(Register reg, std::span<LiveRange *> interferences) {
     for (LiveRange const *interference : interferences) {
-        LiveBundle &bundle = bundles_.at(interference->parent_id);
-
-        if (bundle.allocation().reg() == reg) {
+        if (interference->parent.allocation().reg() == reg) {
             trees_.at(reg.type).remove({interference->start, interference->end});
         }
     }
 }
 
-Output Output::from_bundles(std::vector<LiveBundle> bundles) {
-    std::vector<Stitch> stitches = discover_stitches(bundles);
+Output Output::from_ranges(std::vector<LiveRange *> ranges) {
+    std::vector<Stitch> stitches;
+    patch_liveranges(ranges, stitches);
 
-    assign_spillslots(bundles, stitches);
-
-    return Output{std::move(bundles), stitches};
+    return Output{std::move(ranges), stitches};
 }

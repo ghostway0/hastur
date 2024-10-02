@@ -1,3 +1,7 @@
+#include <compare>
+#include <cstddef>
+#include <vector>
+
 #include <absl/container/btree_map.h>
 
 class CodePoint {
@@ -8,12 +12,12 @@ public:
 
     size_t repr() const { return point_; }
 
-    auto operator<=>(CodePoint const &other) const = default;
-
     CodePoint next_inst() const { return CodePoint{early().point_ + 2}; }
     CodePoint prev_inst() const { return CodePoint{early().point_ - 2}; }
     CodePoint early() const { return CodePoint{point_ & (~static_cast<size_t>(1))}; };
     CodePoint late() const { return CodePoint{point_ | static_cast<size_t>(1)}; };
+
+    auto operator<=>(CodePoint const &other) const = default;
 
 private:
     size_t point_;
@@ -123,6 +127,15 @@ public:
     }
 
     void remove(Interval interval) { btree_.erase(interval); }
+
+    std::vector<T> extract_all() {
+        std::vector<T> out;
+        for (auto const &[_, value] : btree_) {
+            out.push_back(value);
+        }
+
+        return out;
+    }
 
 private:
     absl::btree_map<Interval, T> btree_;

@@ -1,18 +1,92 @@
 #include <algorithm>
 #include <cstdint>
 #include <expected>
-#include <fmt/core.h>
-#include <fmt/format.h>
 #include <map>
 #include <optional>
 #include <queue>
-
-#include <absl/container/btree_map.h>
-#include <absl/container/flat_hash_map.h>
 #include <span>
-#include <spdlog/spdlog.h>
+
+#include <absl/container/flat_hash_map.h>
 
 #include "interval_tree.h"
+
+class Type {
+    /// Encoded in a bitset (0x0 is void, 0xFFFF is invalid):
+    /// +---------------+-----+-------+-----+--------+-------------+
+    /// | 0-2           | 3   | 4     | 5   | 6      | 7-9         |
+    /// +---------------+-----+-------+-----+--------+-------------+
+    /// | log2(bitsize) | int | float | ptr | vector | log2(lanes) |
+    /// +---------------+-----+-------+-----+--------+-------------+
+
+    enum class Base {
+        Void = 0,
+        Int = 1,
+        Float = 2,
+        Ptr = 3,
+        Vector = 4,
+    };
+
+    enum class Size {
+        B8 = 0,
+        B16 = 1,
+        B32 = 2,
+        B64 = 3,
+        B128 = 4,
+        B256 = 5,
+        B512 = 6,
+        B1024 = 7,
+    };
+
+    enum class Lane {
+        L1 = 0,
+        L2 = 1,
+        L4 = 2,
+        L8 = 3,
+        L16 = 4,
+        L32 = 5,
+        L64 = 6,
+        L128 = 7,
+    };
+
+public:
+    Type(Base base, Size size, Lane lane)
+        : bits_{static_cast<uint16_t>(base) | (static_cast<uint16_t>(size) << 3) | (static_cast<uint16_t>(lane) << 7)} {
+    }
+
+    Type() : bits_{0} {}
+
+    Base base() const { return static_cast<Base>(bits_ & 0x7); }
+
+    size_t size_bytes() { return static_cast<size_t>(1) << static_cast<size_t>(size()); }
+
+    Size size() const { return static_cast<Size>((bits_ >> 3) & 0x7); }
+
+    Lane lane() const { return static_cast<Lane>((bits_ >> 7) & 0x7); }
+
+    bool is_void() const { return bits_ == 0; }
+
+    bool is_int() const { return base() == Base::Int; }
+
+    bool is_float() const { return base() == Base::Float; }
+
+    bool is_ptr() const { return base() == Base::Ptr; }
+
+    bool is_vector() const { return base() == Base::Vector; }
+
+    bool operator==(Type const &other) const { return bits_ == other.bits_; }
+
+    bool operator!=(Type const &other) const { return bits_ != other.bits_; }
+
+private:
+    uint16_t bits_;
+};
+
+struct VirtualReg {
+    uint32_t vreg;
+    Type type;
+
+    auto operator<=>(VirtualReg const &other) const = default;
+};
 
 struct LiveRange;
 
@@ -73,6 +147,10 @@ public:
 
     Allocation &operator=(Allocation const &other) = default;
 
+    bool operator==(Allocation const &other) const { return bits_ == other.bits_; }
+
+    bool operator!=(Allocation const &other) const { return bits_ != other.bits_; }
+
 private:
     // bits 0-1 : 0b00 -> invalid, 0b01 -> null, 0b10 -> spill, 0b11 -> reg
     // 2-3 class encoding: 0b00 -> reserved, 0b01 -> int, 0b10 -> float,
@@ -85,13 +163,15 @@ private:
     static constexpr uint32_t kSpill = 0x3;
 };
 
+class LiveBundle;
+
 struct LiveRange {
     CodePoint start;
     CodePoint end;
-    size_t parent_id;
-    RegClass type;
+    LiveBundle *parent;
     size_t spill_cost;
     std::vector<CodePoint> uses;
+    VirtualReg vreg;
 
     Interval live_interval() const { return Interval{start, end}; }
 
@@ -99,7 +179,7 @@ struct LiveRange {
 
     auto operator<=>(LiveRange const &) const = default;
 
-    LiveRange *clone() { return new LiveRange{start, end, parent_id, type, spill_cost, uses}; }
+    LiveRange *clone() { return new LiveRange{start, end, parent, spill_cost, uses, vreg}; }
 };
 
 class LiveBundle {
@@ -193,83 +273,13 @@ public:
         return result;
     }
 
+    auto begin() { return map_.begin(); }
+
+    auto end() { return map_.end(); }
+
 private:
     std::unordered_map<size_t, V> map_{};
     size_t counter_{0};
-};
-
-struct Type {
-    /// Encoded in a bitset (0x0 is void, 0xFFFF is invalid):
-    /// +---------------+-----+-------+-----+--------+-------------+
-    /// | 0-2           | 3   | 4     | 5   | 6      | 7-9         |
-    /// +---------------+-----+-------+-----+--------+-------------+
-    /// | log2(bitsize) | int | float | ptr | vector | log2(lanes) |
-    /// +---------------+-----+-------+-----+--------+-------------+
-
-    enum class Base {
-        Void = 0,
-        Int = 1,
-        Float = 2,
-        Ptr = 3,
-        Vector = 4,
-    };
-
-    enum class Size {
-        B8 = 0,
-        B16 = 1,
-        B32 = 2,
-        B64 = 3,
-        B128 = 4,
-        B256 = 5,
-        B512 = 6,
-        B1024 = 7,
-    };
-
-    enum class Lane {
-        L1 = 0,
-        L2 = 1,
-        L4 = 2,
-        L8 = 3,
-        L16 = 4,
-        L32 = 5,
-        L64 = 6,
-        L128 = 7,
-    };
-
-    Type(Base base, Size size, Lane lane)
-        : bits_{static_cast<uint16_t>(base) | (static_cast<uint16_t>(size) << 3) | (static_cast<uint16_t>(lane) << 7)} {
-    }
-
-    Type() : bits_{0} {}
-
-    Base base() const { return static_cast<Base>(bits_ & 0x7); }
-
-    size_t size_bytes() { return static_cast<size_t>(1) << size(); }
-
-    Size size() const { return static_cast<Size>((bits_ >> 3) & 0x7); }
-
-    Lane lane() const { return static_cast<Lane>((bits_ >> 7) & 0x7); }
-
-    bool is_void() const { return bits_ == 0; }
-
-    bool is_int() const { return base() == Base::Int; }
-
-    bool is_float() const { return base() == Base::Float; }
-
-    bool is_ptr() const { return base() == Base::Ptr; }
-
-    bool is_vector() const { return base() == Base::Vector; }
-
-    bool operator==(Type const &other) const { return bits_ == other.bits_; }
-
-    bool operator!=(Type const &other) const { return bits_ != other.bits_; }
-};
-
-struct VirtualReg {
-    size_t vreg;
-    Type type;
-
-    auto operator<=>(VirtualReg const &other) const = default;
 };
 
 struct Stitch {
@@ -280,10 +290,10 @@ struct Stitch {
 };
 
 struct Output {
-    std::vector<LiveBundle> allocations;
+    std::vector<LiveRange *> allocations;
     std::vector<Stitch> stitches;
 
-    static Output from_bundles(std::vector<LiveBundle> bundles);
+    static Output from_ranges(std::vector<LiveRange *> bundles);
 };
 
 class Allocator {
@@ -302,14 +312,13 @@ private:
     std::priority_queue<LiveRange *, std::vector<LiveRange *>, PriorityCompare> second_chance_;
     std::unordered_map<RegClass, AllocationTree> trees_;
     std::priority_queue<LiveRange *, std::vector<LiveRange *>, PriorityCompare> pending_;
-    IndexedMap<LiveBundle> bundles_;
     TargetISA const &isa_;
 
     std::optional<Register> run_once(LiveRange *range);
 
     std::optional<Register> get_unused_preg(RegClass type, std::span<LiveRange *> interferences);
 
-    std::map<Register, size_t> calculate_eviction_costs(std::span<LiveRange *> interferences);
+    std::flat_hash_map<Register, size_t> calculate_eviction_costs(std::span<LiveRange *> interferences);
 
     std::optional<Register> try_assign_might_evict(LiveRange *range, std::span<LiveRange *> interferences);
 
@@ -318,6 +327,6 @@ private:
     bool try_split(LiveRange *range, CodePoint at);
 
     void evict_for(Register reg, std::span<LiveRange *> interferences);
-};
 
-Output allocate(TargetISA const &isa, std::span<LiveBundle> bundles);
+    std::vector<LiveRange *> extract_ranges();
+};
